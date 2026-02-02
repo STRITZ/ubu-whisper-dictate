@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+Whisper Dictate GUI - Simple voice-to-text dictation for Ubuntu Linux
+
+A lightweight GTK4 application that records your voice and transcribes it
+using whisper.cpp, then pastes the text into your active application.
+
+Usage:
+    1. Click the microphone button (or use your configured hotkey)
+    2. Speak your text
+    3. Click again to stop recording
+    4. Text is automatically pasted into your previous window
+
+Toggle:
+    - OFF (default): Terminal mode - uses Ctrl+Shift+V (works in terminals, Chrome)
+    - ON: Word/Apps mode - uses Ctrl+V (for LibreOffice, etc.)
+"""
+
+import gi
+import subprocess
+import os
+import sys
+import time
+
+gi.require_version('Gtk', '4.0')
+from gi.repository import Gtk, GLib, Gio
+
+# Configuration paths
+WHISPER_DIR = os.path.expanduser("~/.local/share/whisper.cpp")
+MODEL = f"{WHISPER_DIR}/models/ggml-tiny.en.bin"
+WHISPER_BIN = f"{WHISPER_DIR}/build/bin/whisper-cli"
+AUDIO_FILE = "/tmp/dictation_audio.wav"
+YDOTOOL_SOCKET = os.path.expanduser("~/.ydotool_socket")
+
+# Terminal app names that need Ctrl+Shift+V
+TERMINAL_APPS = {
+    "gnome-terminal-server", "gnome-terminal", "konsole", "xterm",
+    "terminator", "tilix", "alacritty", "kitty", "wezterm", "urxvt",
+    "xfce4-terminal", "lxterminal", "mate-terminal", "terminology"
+}
+
+
+def get_active_window_name():
+    """Get active window name using xdotool"""
+    try:
+        result = subprocess.run(
+            ["bash", "-c", """
+            for wid in $(xdotool search --onlyvisible --name ""); do
+                if xprop -id $wid 2>/dev/null | grep -q "_NET_WM_STATE_FOCUSED"; then
+                    xdotool getwindowname $wid 2>/dev/null
+                    exit 0
+                fi
+            done
+            cat /proc/$(xdotool getactivewindow getwindowpid 2>/dev/null)/comm 2>/dev/null || echo "unknown"
+            """],
+            capture_output=True, text=True, timeout=2
+        )
+        return result.stdout.strip() or "unknown"
+    except:
+        return "unknown"
+
+
+def is_terminal(window_name):
+    """Check if window name suggests a terminal"""
+    if not window_name:
+        return False
+    wl = window_name.lower()
+    return (
+        any(t in wl for t in TERMINAL_APPS) or
+        "terminal" in wl or
+        "~" in window_name or
+        window_name.endswith("$") or
+        "@" in window_name
+    )
+
+
+class DictationApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="com.ubu.whisper-dictate")
+        self.recording = False
+        self.record_process = None
+        self.window = None
+        self.button = None
+        self.status_label = None
+        self.target_is_terminal = False
+
+    def do_activate(self):
+        if self.window:
+            self.window.present()
+            return
+
+        self.window = Gtk.ApplicationWindow(application=self)
+        self.window.set_title("")
+        self.window.set_default_size(120, 140)
+        self.window.set_resizable(False)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_margin_top(15)
+        box.set_margin_bottom(15)
+        box.set_margin_start(15)
+        box.set_margin_end(15)
+
+        # Main microphone button
+        self.button = Gtk.Button()
+        self.button.set_icon_name("audio-input-microphone-symbolic")
+        self.button.add_css_class("circular")
+        self.button.set_size_request(70, 70)
+        self.button.connect("clicked", self.on_button_clicked)
+        box.append(self.button)
+
+        # Status label
+        self.status_label = Gtk.Label(label="Ready")
+        box.append(self.status_label)
+
+        # Word/Apps toggle (OFF = Terminal mode default, ON = Word/Apps mode)
+        toggle_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        toggle_box.set_halign(Gtk.Align.CENTER)
+        toggle_label = Gtk.Label(label="Word/Apps")
+        toggle_label.add_css_class("dim-label")
+        self.word_apps_switch = Gtk.Switch()
+        self.word_apps_switch.set_active(False)  # Terminal mode by default
+        toggle_box.append(toggle_label)
+        toggle_box.append(self.word_apps_switch)
+        box.append(toggle_box)
+
+        self.window.set_child(box)
+
+        # Apply CSS styling
+        css_provider = Gtk.CssProvider()
+        css = """
+            .mic-ready { background: #3584e4; color: white; }
+            .mic-ready:hover { background: #1c71d8; }
+            .mic-recording { background: #e01b24; color: white; }
+            .mic-recording:hover { background: #c01020; }
+            .mic-processing { background: #f5c211; color: black; }
+            .dim-label { font-size: 10px; color: #888; }
+        """
+        css_provider.load_from_data(css.encode())
+        Gtk.StyleContext.add_provider_for_display(
+            self.window.get_display(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
+
+        self.set_ready_state()
+        self.window.present()
+
+    def set_ready_state(self):
+        self.button.remove_css_class("mic-recording")
+        self.button.remove_css_class("mic-processing")
+        self.button.add_css_class("mic-ready")
+        self.button.set_icon_name("audio-input-microphone-symbolic")
+        self.button.set_sensitive(True)
+        self.status_label.set_text("Ready")
+        return False
+
+    def set_recording_state(self):
+        self.button.remove_css_class("mic-ready")
+        self.button.remove_css_class("mic-processing")
+        self.button.add_css_class("mic-recording")
+        self.button.set_icon_name("media-record-symbolic")
+        self.status_label.set_text("Recording...")
+
+    def set_processing_state(self):
+        self.button.remove_css_class("mic-ready")
+        self.button.remove_css_class("mic-recording")
+        self.button.add_css_class("mic-processing")
+        self.button.set_icon_name("emblem-synchronizing-symbolic")
+        self.button.set_sensitive(False)
+        self.status_label.set_text("Processing...")
+
+    def paste_text(self, text):
+        """Copy to clipboard and paste into previous window"""
+        # Copy to both clipboards
+        subprocess.run(["wl-copy", "--", text], check=False)
+        subprocess.run(["wl-copy", "--primary", "--", text], check=False)
+        time.sleep(0.2)
+
+        env = os.environ.copy()
+        env["YDOTOOL_SOCKET"] = YDOTOOL_SOCKET
+
+        # Alt+Tab back to previous window
+        subprocess.run(["ydotool", "key", "56:1", "15:1", "15:0", "56:0"], env=env)
+        time.sleep(0.3)
+
+        # Check switch state - OFF = Terminal mode (default), ON = Word/Apps mode
+        if self.word_apps_switch.get_active():
+            # Ctrl+V for Word/Apps
+            subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"], env=env)
+        else:
+            # Ctrl+Shift+V for Terminal mode (default)
+            subprocess.run(["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"], env=env)
+
+    def on_button_clicked(self, button):
+        if not self.recording:
+            self.start_recording()
+        else:
+            self.stop_recording()
+
+    def start_recording(self):
+        self.recording = True
+        self.set_recording_state()
+
+        self.record_process = subprocess.Popen(
+            ["arecord", "-f", "cd", "-t", "wav", "-r", "16000", "-c", "1", AUDIO_FILE],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
+
+    def stop_recording(self):
+        self.recording = False
+        self.set_processing_state()
+
+        if self.record_process:
+            self.record_process.terminate()
+            self.record_process.wait()
+            self.record_process = None
+
+        GLib.timeout_add(200, self.transcribe)
+
+    def transcribe(self):
+        if not os.path.exists(AUDIO_FILE):
+            self.set_ready_state()
+            return False
+
+        try:
+            result = subprocess.run(
+                [WHISPER_BIN, "-m", MODEL, "-f", AUDIO_FILE, "--no-timestamps", "-nt"],
+                capture_output=True,
+                text=True
+            )
+            text = result.stdout.strip()
+
+            if text:
+                self.paste_text(text)
+                self.status_label.set_text("Done!")
+                GLib.timeout_add(1500, self.set_ready_state)
+            else:
+                self.set_ready_state()
+
+        except Exception as e:
+            print(f"Error: {e}")
+            self.set_ready_state()
+        finally:
+            if os.path.exists(AUDIO_FILE):
+                os.remove(AUDIO_FILE)
+
+        return False
+
+
+if __name__ == "__main__":
+    app = DictationApp()
+    app.run(sys.argv)
