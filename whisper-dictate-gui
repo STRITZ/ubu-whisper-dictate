@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
-"""
-Whisper Dictate GUI - Simple voice-to-text dictation for Ubuntu Linux
-
-A lightweight GTK4 application that records your voice and transcribes it
-using whisper.cpp, then pastes the text into your active application.
-
-Usage:
-    1. Click the microphone button (or use your configured hotkey)
-    2. Speak your text
-    3. Click again to stop recording
-    4. Text is automatically pasted into your previous window
-
-Toggle:
-    - OFF (default): Terminal mode - uses Ctrl+Shift+V (works in terminals, Chrome)
-    - ON: Word/Apps mode - uses Ctrl+V (for LibreOffice, etc.)
-"""
+"""Simple dictation GUI using whisper.cpp"""
 
 import gi
 import subprocess
@@ -25,32 +10,39 @@ import time
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib, Gio
 
-# Configuration paths
 WHISPER_DIR = os.path.expanduser("~/.local/share/whisper.cpp")
 MODEL = f"{WHISPER_DIR}/models/ggml-tiny.en.bin"
 WHISPER_BIN = f"{WHISPER_DIR}/build/bin/whisper-cli"
 AUDIO_FILE = "/tmp/dictation_audio.wav"
 YDOTOOL_SOCKET = os.path.expanduser("~/.ydotool_socket")
 
-# Terminal app names that need Ctrl+Shift+V
-TERMINAL_APPS = {
-    "gnome-terminal-server", "gnome-terminal", "konsole", "xterm",
-    "terminator", "tilix", "alacritty", "kitty", "wezterm", "urxvt",
-    "xfce4-terminal", "lxterminal", "mate-terminal", "terminology"
+# Common whisper hallucinations from silence/noise - filter these out
+HALLUCINATIONS = {
+    "you", "thank you", "thanks", "bye", "okay", "so", "the", "and",
+    "i", "a", "to", "it", "is", "that", "for", "on", "are", "as",
+    "you.", "thank you.", "thanks.", "bye.", "okay.",
+    "[music]", "[blank_audio]", "(music)", "[silence]",
 }
 
+# Terminal app names that need Ctrl+Shift+V
+TERMINAL_APPS = {"gnome-terminal-server", "gnome-terminal", "konsole", "xterm",
+    "terminator", "tilix", "alacritty", "kitty", "wezterm", "urxvt",
+    "xfce4-terminal", "lxterminal", "mate-terminal", "terminology"}
 
 def get_active_window_name():
-    """Get active window name using xdotool"""
+    """Get active window name using wmctrl or fallback"""
     try:
+        # Try using qdbus to get active window from KWin/GNOME
         result = subprocess.run(
             ["bash", "-c", """
+            # Get list of windows and find the active one
             for wid in $(xdotool search --onlyvisible --name ""); do
                 if xprop -id $wid 2>/dev/null | grep -q "_NET_WM_STATE_FOCUSED"; then
                     xdotool getwindowname $wid 2>/dev/null
                     exit 0
                 fi
             done
+            # Fallback: check /proc for foreground process
             cat /proc/$(xdotool getactivewindow getwindowpid 2>/dev/null)/comm 2>/dev/null || echo "unknown"
             """],
             capture_output=True, text=True, timeout=2
@@ -59,24 +51,17 @@ def get_active_window_name():
     except:
         return "unknown"
 
-
 def is_terminal(window_name):
     """Check if window name suggests a terminal"""
     if not window_name:
         return False
     wl = window_name.lower()
-    return (
-        any(t in wl for t in TERMINAL_APPS) or
-        "terminal" in wl or
-        "~" in window_name or
-        window_name.endswith("$") or
-        "@" in window_name
-    )
-
+    # Check for common terminal indicators
+    return any(t in wl for t in TERMINAL_APPS) or "terminal" in wl or "~" in window_name or window_name.endswith("$") or "@" in window_name
 
 class DictationApp(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="com.ubu.whisper-dictate")
+        super().__init__(application_id="com.local.whisper-dictate")
         self.recording = False
         self.record_process = None
         self.window = None
@@ -102,7 +87,6 @@ class DictationApp(Gtk.Application):
         box.set_margin_start(15)
         box.set_margin_end(15)
 
-        # Main microphone button
         self.button = Gtk.Button()
         self.button.set_icon_name("audio-input-microphone-symbolic")
         self.button.add_css_class("circular")
@@ -110,7 +94,6 @@ class DictationApp(Gtk.Application):
         self.button.connect("clicked", self.on_button_clicked)
         box.append(self.button)
 
-        # Status label
         self.status_label = Gtk.Label(label="Ready")
         box.append(self.status_label)
 
@@ -127,7 +110,6 @@ class DictationApp(Gtk.Application):
 
         self.window.set_child(box)
 
-        # Apply CSS styling
         css_provider = Gtk.CssProvider()
         css = """
             .mic-ready { background: #3584e4; color: white; }
@@ -172,8 +154,7 @@ class DictationApp(Gtk.Application):
         self.status_label.set_text("Processing...")
 
     def paste_text(self, text):
-        """Copy to clipboard and paste into previous window"""
-        # Copy to both clipboards
+        """Copy to clipboard and paste"""
         subprocess.run(["wl-copy", "--", text], check=False)
         subprocess.run(["wl-copy", "--primary", "--", text], check=False)
         time.sleep(0.2)
@@ -181,7 +162,7 @@ class DictationApp(Gtk.Application):
         env = os.environ.copy()
         env["YDOTOOL_SOCKET"] = YDOTOOL_SOCKET
 
-        # Alt+Tab back to previous window
+        # Alt+Tab back
         subprocess.run(["ydotool", "key", "56:1", "15:1", "15:0", "56:0"], env=env)
         time.sleep(0.3)
 
@@ -227,11 +208,22 @@ class DictationApp(Gtk.Application):
 
         try:
             result = subprocess.run(
-                [WHISPER_BIN, "-m", MODEL, "-f", AUDIO_FILE, "--no-timestamps", "-nt"],
+                [WHISPER_BIN, "-m", MODEL, "-f", AUDIO_FILE,
+                 "--no-timestamps", "-nt", "-np"],  # -np suppresses debug output
                 capture_output=True,
                 text=True
             )
             text = result.stdout.strip()
+
+            # Debug: print what we got
+            print(f"Whisper output: '{text}'")
+
+            # Filter out common hallucinations from silence
+            if text.lower() in HALLUCINATIONS or len(text) < 3:
+                print(f"Filtered hallucination: '{text}'")
+                self.status_label.set_text("No speech detected")
+                GLib.timeout_add(1500, self.set_ready_state)
+                return False
 
             if text:
                 self.paste_text(text)
@@ -248,7 +240,6 @@ class DictationApp(Gtk.Application):
                 os.remove(AUDIO_FILE)
 
         return False
-
 
 if __name__ == "__main__":
     app = DictationApp()
