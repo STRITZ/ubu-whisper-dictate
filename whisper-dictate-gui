@@ -90,6 +90,8 @@ class DictationApp(Gtk.Application):
         self.status_label = None
         self.target_is_terminal = False
         self.ipc_server = None
+        self.hotkey_triggered = False
+        self.uinput = None
 
     def do_command_line(self, command_line):
         args = command_line.get_arguments()
@@ -115,48 +117,128 @@ class DictationApp(Gtk.Application):
 
         self.window = Gtk.ApplicationWindow(application=self)
         self.window.set_title("")
-        self.window.set_default_size(120, 140)
+        self.window.set_default_size(300, 380)
         self.window.set_resizable(False)
+        self.window.set_decorated(False)
 
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        outer.add_css_class("app-container")
+
+        # Drag bar at the top
+        drag_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        drag_bar.set_size_request(-1, 36)
+        drag_bar.add_css_class("drag-bar")
+        drag_icon = Gtk.Image.new_from_icon_name("open-menu-symbolic")
+        drag_icon.add_css_class("drag-icon")
+        drag_bar.set_halign(Gtk.Align.FILL)
+        drag_bar.set_valign(Gtk.Align.START)
+        # Center the drag icon
+        drag_bar.append(Gtk.Box(hexpand=True))
+        drag_bar.append(drag_icon)
+        drag_bar.append(Gtk.Box(hexpand=True))
+
+        # Enable dragging on the bar
+        drag_gesture = Gtk.GestureDrag()
+        drag_gesture.connect("drag-begin", self._on_drag_begin)
+        drag_gesture.connect("drag-update", self._on_drag_update)
+        drag_bar.add_controller(drag_gesture)
+
+        outer.append(drag_bar)
+
+        # Main content
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         box.set_halign(Gtk.Align.CENTER)
         box.set_valign(Gtk.Align.CENTER)
-        box.set_margin_top(15)
-        box.set_margin_bottom(15)
-        box.set_margin_start(15)
-        box.set_margin_end(15)
+        box.set_vexpand(True)
+        box.set_margin_top(20)
+        box.set_margin_bottom(20)
+        box.set_margin_start(30)
+        box.set_margin_end(30)
 
         self.button = Gtk.Button()
         self.button.set_icon_name("audio-input-microphone-symbolic")
         self.button.add_css_class("circular")
-        self.button.set_size_request(70, 70)
-        self.button.connect("clicked", self.on_button_clicked)
+        self.button.add_css_class("mic-button")
+        self.button.set_size_request(180, 180)
+        self.button.set_sensitive(False)
         box.append(self.button)
 
         self.status_label = Gtk.Label(label="Ready")
+        self.status_label.add_css_class("status-label")
         box.append(self.status_label)
 
-        # Word/Apps toggle (OFF = Terminal mode default, ON = Word/Apps mode)
-        toggle_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-        toggle_box.set_halign(Gtk.Align.CENTER)
-        toggle_label = Gtk.Label(label="Word/Apps")
-        toggle_label.add_css_class("dim-label")
-        self.word_apps_switch = Gtk.Switch()
-        self.word_apps_switch.set_active(False)  # Terminal mode by default
-        toggle_box.append(toggle_label)
-        toggle_box.append(self.word_apps_switch)
-        box.append(toggle_box)
+        close_button = Gtk.Button(label="Close")
+        close_button.add_css_class("close-button")
+        close_button.set_size_request(-1, 40)
+        close_button.set_halign(Gtk.Align.FILL)
+        close_button.connect("clicked", lambda b: self.quit())
+        box.append(close_button)
 
-        self.window.set_child(box)
+        hint_label = Gtk.Label(label="Double tap ALT to Start / Stop")
+        hint_label.add_css_class("hint-label")
+        box.append(hint_label)
+
+        outer.append(box)
+        self.window.set_child(outer)
 
         css_provider = Gtk.CssProvider()
         css = """
+            .app-container {
+                background: rgba(30, 30, 30, 0.95);
+                border-radius: 16px;
+            }
+            .drag-bar {
+                background: rgba(255, 255, 255, 0.08);
+                border-radius: 16px 16px 0 0;
+                padding: 8px;
+            }
+            .drag-bar:hover {
+                background: rgba(255, 255, 255, 0.12);
+            }
+            .drag-icon {
+                color: rgba(255, 255, 255, 0.4);
+                -gtk-icon-size: 16px;
+            }
+            .mic-button {
+                min-width: 180px;
+                min-height: 180px;
+                border-radius: 50%;
+                border: none;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+                -gtk-icon-size: 64px;
+            }
             .mic-ready { background: #3584e4; color: white; }
             .mic-ready:hover { background: #1c71d8; }
             .mic-recording { background: #e01b24; color: white; }
             .mic-recording:hover { background: #c01020; }
             .mic-processing { background: #f5c211; color: black; }
-            .dim-label { font-size: 10px; color: #888; }
+            .status-label {
+                font-size: 18px;
+                color: #ccc;
+                font-weight: 500;
+            }
+            .close-button {
+                min-height: 40px;
+                padding: 6px 24px;
+                background: rgba(255, 255, 255, 0.1);
+                color: #aaa;
+                border: 1px solid rgba(255, 255, 255, 0.15);
+                border-radius: 8px;
+                font-size: 14px;
+            }
+            .close-button:hover {
+                background: rgba(224, 27, 36, 0.8);
+                color: white;
+                border-color: transparent;
+            }
+            .hint-label {
+                font-size: 10px;
+                color: rgba(255, 255, 255, 0.35);
+                margin-top: 4px;
+            }
+            window {
+                background: transparent;
+            }
         """
         css_provider.load_from_data(css.encode())
         Gtk.StyleContext.add_provider_for_display(
@@ -173,6 +255,24 @@ class DictationApp(Gtk.Application):
 
         # Start Alt double-tap hotkey listener
         self._start_hotkey_listener()
+
+        # Create virtual keyboard for sending keystrokes (bypasses ydotool)
+        self._init_uinput()
+
+    def _on_drag_begin(self, gesture, start_x, start_y):
+        """Store the window position when drag starts."""
+        self._drag_start_x, self._drag_start_y = self.window.get_position() if hasattr(self.window, 'get_position') else (0, 0)
+        # Use the native surface to begin move
+        native = self.window.get_native()
+        if native:
+            surface = native.get_surface()
+            if surface:
+                gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+                surface.begin_move(gesture.get_device(), gesture.get_current_button(), start_x, start_y, GLib.get_monotonic_time() / 1000)
+
+    def _on_drag_update(self, gesture, offset_x, offset_y):
+        """No-op — the window manager handles the move after begin_move."""
+        pass
 
     def _set_always_on_top(self):
         """Set window as always-on-top using xdotool + wmctrl."""
@@ -192,6 +292,30 @@ class DictationApp(Gtk.Application):
         except Exception as e:
             print(f"Could not set always-on-top: {e}")
         return False
+
+    def _init_uinput(self):
+        """Create a virtual keyboard for sending keystrokes directly."""
+        try:
+            from evdev import UInput, ecodes
+            self.uinput = UInput({ecodes.EV_KEY: [
+                ecodes.KEY_LEFTALT, ecodes.KEY_TAB,
+                ecodes.KEY_LEFTCTRL, ecodes.KEY_LEFTSHIFT, ecodes.KEY_V
+            ]}, name='whisper-dictate-kbd')
+            print("UInput virtual keyboard created")
+        except Exception as e:
+            print(f"Could not create UInput device: {e}")
+            self.uinput = None
+
+    def _send_keys(self, keys, delay=0.05):
+        """Send a key combination via UInput."""
+        from evdev import ecodes
+        for key in keys:
+            self.uinput.write(ecodes.EV_KEY, key, 1)
+        self.uinput.syn()
+        time.sleep(delay)
+        for key in reversed(keys):
+            self.uinput.write(ecodes.EV_KEY, key, 0)
+        self.uinput.syn()
 
     def _start_hotkey_listener(self):
         """Listen for Alt double-tap to toggle recording."""
@@ -274,8 +398,12 @@ class DictationApp(Gtk.Application):
         thread.start()
 
     def toggle_recording(self):
-        """Toggle recording state (called from IPC)."""
-        self.on_button_clicked(None)
+        """Toggle recording state (called from IPC, hotkey, or button click)."""
+        if not self.recording:
+            self.hotkey_triggered = True
+            self.start_recording()
+        else:
+            self.stop_recording()
         return False
 
     def set_ready_state(self):
@@ -283,7 +411,6 @@ class DictationApp(Gtk.Application):
         self.button.remove_css_class("mic-processing")
         self.button.add_css_class("mic-ready")
         self.button.set_icon_name("audio-input-microphone-symbolic")
-        self.button.set_sensitive(True)
         self.status_label.set_text("Ready")
         return False
 
@@ -299,35 +426,44 @@ class DictationApp(Gtk.Application):
         self.button.remove_css_class("mic-recording")
         self.button.add_css_class("mic-processing")
         self.button.set_icon_name("emblem-synchronizing-symbolic")
-        self.button.set_sensitive(False)
         self.status_label.set_text("Processing...")
 
     def paste_text(self, text):
-        """Copy to clipboard and paste"""
-        subprocess.run(["wl-copy", "--", text], check=False)
-        subprocess.run(["wl-copy", "--primary", "--", text], check=False)
-        time.sleep(0.2)
+        """Copy to clipboard and paste in a background thread"""
+        need_alt_tab = not self.hotkey_triggered
+        self.hotkey_triggered = False
+        print(f"paste_text called with: '{text}' (need_alt_tab={need_alt_tab})", flush=True)
 
-        env = os.environ.copy()
-        env["YDOTOOL_SOCKET"] = YDOTOOL_SOCKET
+        def do_paste():
+            try:
+                print("do_paste thread started", flush=True)
+                env = os.environ.copy()
+                env["YDOTOOL_SOCKET"] = YDOTOOL_SOCKET
 
-        # Alt+Tab back
-        subprocess.run(["ydotool", "key", "56:1", "15:1", "15:0", "56:0"], env=env)
-        time.sleep(0.3)
+                if need_alt_tab:
+                    # Button click stole focus — Alt+Tab back to previous window
+                    print("Sending Alt+Tab to return focus...", flush=True)
+                    subprocess.run(["ydotool", "key", "56:1", "15:1", "15:0", "56:0"], env=env, check=False, timeout=3)
+                    time.sleep(0.5)
+                else:
+                    # Hotkey triggered — target window still has focus
+                    time.sleep(0.3)
 
-        # Check switch state - OFF = Terminal mode (default), ON = Word/Apps mode
-        if self.word_apps_switch.get_active():
-            # Ctrl+V for Word/Apps
-            subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"], env=env)
-        else:
-            # Ctrl+Shift+V for Terminal mode (default)
-            subprocess.run(["ydotool", "key", "29:1", "42:1", "47:1", "47:0", "42:0", "29:0"], env=env)
+                # Type the text directly via ydotool (avoids clipboard X11/Wayland mismatch)
+                print(f"Typing text via ydotool...", flush=True)
+                subprocess.run(["ydotool", "type", "--", text], env=env, check=False, timeout=10)
+                print("Paste complete", flush=True)
+            except Exception as e:
+                import traceback
+                print(f"Paste error: {e}", flush=True)
+                traceback.print_exc()
 
-    def on_button_clicked(self, button):
-        if not self.recording:
-            self.start_recording()
-        else:
-            self.stop_recording()
+        try:
+            t = threading.Thread(target=do_paste, daemon=True)
+            t.start()
+            print(f"Paste thread started: {t.name}", flush=True)
+        except Exception as e:
+            print(f"Failed to start paste thread: {e}", flush=True)
 
     def start_recording(self):
         self.recording = True
