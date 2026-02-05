@@ -13,6 +13,7 @@ import subprocess
 import time
 import socket
 import threading
+import select
 
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib, Gio
@@ -170,6 +171,9 @@ class DictationApp(Gtk.Application):
         # Set always-on-top after window is fully mapped
         GLib.timeout_add(200, self._set_always_on_top)
 
+        # Start Alt double-tap hotkey listener
+        self._start_hotkey_listener()
+
     def _set_always_on_top(self):
         """Set window as always-on-top using xdotool + wmctrl."""
         try:
@@ -188,6 +192,57 @@ class DictationApp(Gtk.Application):
         except Exception as e:
             print(f"Could not set always-on-top: {e}")
         return False
+
+    def _start_hotkey_listener(self):
+        """Listen for Alt double-tap to toggle recording."""
+        try:
+            import evdev
+            from evdev import ecodes
+        except ImportError:
+            print("python3-evdev not installed - Alt double-tap hotkey disabled")
+            return
+
+        def listener_thread():
+            devices = []
+            for path in evdev.list_devices():
+                try:
+                    devices.append(evdev.InputDevice(path))
+                except PermissionError:
+                    continue
+
+            keyboards = [d for d in devices if ecodes.EV_KEY in d.capabilities()]
+            if not keyboards:
+                print("No keyboard devices found for hotkey listener")
+                return
+
+            last_alt_release = 0
+            other_key_pressed = False
+
+            while True:
+                try:
+                    r, _, _ = select.select(keyboards, [], [])
+                    for dev in r:
+                        for event in dev.read():
+                            if event.type != ecodes.EV_KEY:
+                                continue
+
+                            if event.code in (ecodes.KEY_LEFTALT, ecodes.KEY_RIGHTALT):
+                                if event.value == 1:  # Key down
+                                    other_key_pressed = False
+                                elif event.value == 0:  # Key up
+                                    now = time.time()
+                                    if not other_key_pressed and (now - last_alt_release) < 0.4:
+                                        GLib.idle_add(self.toggle_recording)
+                                        last_alt_release = 0
+                                    else:
+                                        last_alt_release = now
+                            elif event.value == 1:  # Any other key pressed
+                                other_key_pressed = True
+                except Exception:
+                    break
+
+        thread = threading.Thread(target=listener_thread, daemon=True)
+        thread.start()
 
     def start_ipc_server(self):
         """Start Unix socket server for IPC."""

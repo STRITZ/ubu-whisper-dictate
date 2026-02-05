@@ -63,7 +63,8 @@ sudo apt install -y \
     build-essential \
     xdotool \
     x11-utils \
-    wmctrl
+    wmctrl \
+    python3-evdev
 
 print_success "System dependencies installed"
 
@@ -130,7 +131,16 @@ systemctl --user start ydotoold.service || print_warning "ydotoold may already b
 
 print_success "ydotool daemon configured"
 
-# Step 5: Install the main application
+# Step 5: Add user to input group (required for Alt double-tap hotkey)
+if ! groups "$USER" | grep -q '\binput\b'; then
+    print_status "Adding $USER to 'input' group for hotkey detection..."
+    sudo usermod -aG input "$USER"
+    print_warning "You will need to log out and back in for the input group to take effect"
+else
+    print_success "User already in 'input' group"
+fi
+
+# Step 6: Install the main application
 print_status "Installing whisper-dictate-gui..."
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -139,7 +149,7 @@ chmod +x "$INSTALL_DIR/whisper-dictate-gui"
 
 print_success "Application installed to $INSTALL_DIR/whisper-dictate-gui"
 
-# Step 6: Create desktop entry for application menu
+# Step 7: Create desktop entry for application menu
 print_status "Creating desktop entry..."
 
 mkdir -p ~/.local/share/applications
@@ -158,7 +168,7 @@ EOF
 
 print_success "Desktop entry created"
 
-# Step 7: Update desktop database
+# Step 8: Update desktop database
 print_status "Updating desktop database..."
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
 
