@@ -19,8 +19,9 @@ gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib, Gio
 
 WHISPER_DIR = os.path.expanduser("~/.local/share/whisper.cpp")
-MODEL = f"{WHISPER_DIR}/models/ggml-tiny.en.bin"
+MODEL = f"{WHISPER_DIR}/models/ggml-small.en.bin"
 WHISPER_BIN = f"{WHISPER_DIR}/build/bin/whisper-cli"
+WHISPER_SERVER = "http://127.0.0.1:8178/inference"
 AUDIO_FILE = "/tmp/dictation_audio.wav"
 YDOTOOL_SOCKET = os.path.expanduser("~/.ydotool_socket")
 IPC_SOCKET = "/tmp/whisper-dictate.sock"
@@ -259,6 +260,55 @@ class DictationApp(Gtk.Application):
         # Create virtual keyboard for sending keystrokes (bypasses ydotool)
         self._init_uinput()
 
+        # Start whisper-server (model stays in RAM for fast transcription)
+        subprocess.run(["systemctl", "--user", "start", "whisper-server"],
+                       check=False, capture_output=True)
+        print("Whisper server started", flush=True)
+
+    def do_shutdown(self):
+        """Clean up all resources on app exit."""
+        print("Shutting down...", flush=True)
+
+        # Stop any active recording
+        if self.record_process:
+            self.record_process.terminate()
+            try:
+                self.record_process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.record_process.kill()
+            self.record_process = None
+
+        # Stop whisper-server
+        subprocess.run(["systemctl", "--user", "stop", "whisper-server"],
+                       check=False, capture_output=True)
+        print("Whisper server stopped", flush=True)
+
+        # Close UInput virtual keyboard
+        if self.uinput:
+            try:
+                self.uinput.close()
+            except Exception:
+                pass
+            self.uinput = None
+
+        # Close IPC server socket
+        if self.ipc_server:
+            try:
+                self.ipc_server.close()
+            except Exception:
+                pass
+
+        # Remove socket and temp files
+        for f in [IPC_SOCKET, AUDIO_FILE, "/tmp/whisper_paste.txt",
+                  AUDIO_FILE + ".norm.wav"]:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+        print("Cleanup complete", flush=True)
+        Gtk.Application.do_shutdown(self)
+
     def _on_drag_begin(self, gesture, start_x, start_y):
         """Store the window position when drag starts."""
         self._drag_start_x, self._drag_start_y = self.window.get_position() if hasattr(self.window, 'get_position') else (0, 0)
@@ -406,7 +456,35 @@ class DictationApp(Gtk.Application):
             self.stop_recording()
         return False
 
+    def _start_dot_animation(self, label):
+        """Animate dots with fixed width — invisible dots reserve space."""
+        self._anim_label = label
+        self._anim_dots = 0
+        # All 3 dots invisible to establish full width
+        self.status_label.set_markup(
+            f"{label}<span foreground='#1e1e1e'>...</span>")
+        self._anim_timer = GLib.timeout_add(1000, self._tick_dots)
+
+    def _tick_dots(self):
+        """Advance the dot animation — hidden dots keep width constant."""
+        self._anim_dots = (self._anim_dots % 3) + 1
+        visible = "." * self._anim_dots
+        hidden = 3 - self._anim_dots
+        if hidden:
+            self.status_label.set_markup(
+                f"{self._anim_label}{visible}<span foreground='#1e1e1e'>{'.' * hidden}</span>")
+        else:
+            self.status_label.set_markup(f"{self._anim_label}{visible}")
+        return True  # Keep timer running
+
+    def _stop_dot_animation(self):
+        """Stop the dot animation timer."""
+        if hasattr(self, '_anim_timer') and self._anim_timer:
+            GLib.source_remove(self._anim_timer)
+            self._anim_timer = None
+
     def set_ready_state(self):
+        self._stop_dot_animation()
         self.button.remove_css_class("mic-recording")
         self.button.remove_css_class("mic-processing")
         self.button.add_css_class("mic-ready")
@@ -419,58 +497,51 @@ class DictationApp(Gtk.Application):
         self.button.remove_css_class("mic-processing")
         self.button.add_css_class("mic-recording")
         self.button.set_icon_name("media-record-symbolic")
-        self.status_label.set_text("Recording...")
+        self._start_dot_animation("Listening")
 
     def set_processing_state(self):
+        self._stop_dot_animation()
         self.button.remove_css_class("mic-ready")
         self.button.remove_css_class("mic-recording")
         self.button.add_css_class("mic-processing")
         self.button.set_icon_name("emblem-synchronizing-symbolic")
-        self.status_label.set_text("Processing...")
+        self._start_dot_animation("Proofing")
 
     def paste_text(self, text):
-        """Copy to clipboard and paste in a background thread"""
+        """Copy to Wayland clipboard and paste instantly via Ctrl+V"""
         need_alt_tab = not self.hotkey_triggered
         self.hotkey_triggered = False
-        print(f"paste_text called with: '{text}' (need_alt_tab={need_alt_tab})", flush=True)
+        print(f"paste_text: {len(text)} chars (need_alt_tab={need_alt_tab})", flush=True)
 
         def do_paste():
             try:
-                print("do_paste thread started", flush=True)
                 env = os.environ.copy()
                 env["YDOTOOL_SOCKET"] = YDOTOOL_SOCKET
 
                 if need_alt_tab:
-                    # Button click stole focus — Alt+Tab back to previous window
-                    print("Sending Alt+Tab to return focus...", flush=True)
-                    subprocess.run(["ydotool", "key", "56:1", "15:1", "15:0", "56:0"], env=env, check=False, timeout=3)
+                    subprocess.run(["ydotool", "key", "56:1", "15:1", "15:0", "56:0"],
+                                   env=env, check=False, timeout=3)
                     time.sleep(0.5)
                 else:
-                    # Hotkey triggered — target window still has focus
                     time.sleep(0.3)
 
-                # Type the text directly via ydotool (avoids clipboard X11/Wayland mismatch)
-                print(f"Typing text via ydotool...", flush=True)
-                subprocess.run(["ydotool", "type", "--", text], env=env, check=False, timeout=10)
-                print("Paste complete", flush=True)
+                # Type text with zero delays — fast burst
+                subprocess.run(
+                    ["ydotool", "type", "--key-delay", "2", "--key-hold", "0", "--", text],
+                    env=env, check=False, timeout=120
+                )
+                print(f"Typed {len(text)} chars", flush=True)
             except Exception as e:
-                import traceback
                 print(f"Paste error: {e}", flush=True)
-                traceback.print_exc()
 
-        try:
-            t = threading.Thread(target=do_paste, daemon=True)
-            t.start()
-            print(f"Paste thread started: {t.name}", flush=True)
-        except Exception as e:
-            print(f"Failed to start paste thread: {e}", flush=True)
+        threading.Thread(target=do_paste, daemon=True).start()
 
     def start_recording(self):
         self.recording = True
         self.set_recording_state()
 
         self.record_process = subprocess.Popen(
-            ["arecord", "-f", "cd", "-t", "wav", "-r", "16000", "-c", "1", AUDIO_FILE],
+            ["arecord", "-f", "S16_LE", "-t", "wav", "-r", "16000", "-c", "1", AUDIO_FILE],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL
         )
@@ -491,38 +562,78 @@ class DictationApp(Gtk.Application):
             self.set_ready_state()
             return False
 
-        try:
-            result = subprocess.run(
-                [WHISPER_BIN, "-m", MODEL, "-f", AUDIO_FILE,
-                 "--no-timestamps", "-nt", "-np"],
-                capture_output=True,
-                text=True
-            )
-            text = result.stdout.strip()
+        def do_transcribe():
+            try:
+                # Normalize audio levels so quiet speech is boosted before whisper
+                try:
+                    normalized = AUDIO_FILE + ".norm.wav"
+                    subprocess.run(
+                        ["ffmpeg", "-i", AUDIO_FILE, "-af", "dynaudnorm=p=0.95:s=3",
+                         "-ar", "16000", "-ac", "1", "-y", normalized],
+                        capture_output=True, timeout=30
+                    )
+                    if os.path.exists(normalized):
+                        os.replace(normalized, AUDIO_FILE)
+                        print("Audio normalized", flush=True)
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass  # ffmpeg unavailable, use raw audio
 
-            print(f"Whisper output: '{text}'")
+                # Use whisper-server HTTP API (model preloaded in RAM)
+                import urllib.request
+                import json
 
-            # Filter out common hallucinations from silence
-            if text.lower() in HALLUCINATIONS or len(text) < 3:
-                print(f"Filtered hallucination: '{text}'")
-                self.status_label.set_text("No speech detected")
-                GLib.timeout_add(1500, self.set_ready_state)
-                return False
+                boundary = "----WhisperBoundary"
+                with open(AUDIO_FILE, "rb") as f:
+                    audio_data = f.read()
 
-            if text:
-                self.paste_text(text)
-                self.status_label.set_text("Done!")
-                GLib.timeout_add(1500, self.set_ready_state)
-            else:
-                self.set_ready_state()
+                body = (
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+                    f"Content-Type: audio/wav\r\n\r\n"
+                ).encode() + audio_data + f"\r\n--{boundary}--\r\n".encode()
 
-        except Exception as e:
-            print(f"Error: {e}")
+                req = urllib.request.Request(
+                    WHISPER_SERVER,
+                    data=body,
+                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                    method="POST"
+                )
+
+                t0 = time.time()
+                with urllib.request.urlopen(req, timeout=300) as resp:
+                    result = json.loads(resp.read().decode())
+
+                text = result.get("text", "").strip()
+                print(f"Whisper server: {len(text)} chars in {time.time()-t0:.1f}s: '{text[:200]}'", flush=True)
+                GLib.idle_add(self._handle_transcription, text)
+            except Exception as e:
+                print(f"Transcription error: {e}", flush=True)
+                GLib.idle_add(self.set_ready_state)
+            finally:
+                try:
+                    os.remove(AUDIO_FILE)
+                except OSError:
+                    pass
+
+        threading.Thread(target=do_transcribe, daemon=True).start()
+        return False
+
+    def _handle_transcription(self, text):
+        """Handle transcription result on main thread."""
+        self._stop_dot_animation()
+
+        if text.lower() in HALLUCINATIONS or len(text) < 3:
+            print(f"Filtered hallucination: '{text}'", flush=True)
+            self.status_label.set_text("No speech detected")
+            GLib.timeout_add(1500, self.set_ready_state)
+            return False
+
+        if text:
+            self.paste_text(text)
+            self.status_label.set_text("Done!")
+            GLib.timeout_add(1500, self.set_ready_state)
+        else:
             self.set_ready_state()
-        finally:
-            if os.path.exists(AUDIO_FILE):
-                os.remove(AUDIO_FILE)
-
         return False
 
 
