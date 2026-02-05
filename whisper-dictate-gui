@@ -3,6 +3,7 @@
 
 import os
 import sys
+import re
 
 # Force X11 backend so we can use wmctrl to set always-on-top.
 # wl-copy and ydotool still work since they're independent Wayland clients.
@@ -78,6 +79,15 @@ def is_terminal(window_name):
         return False
     wl = window_name.lower()
     return any(t in wl for t in TERMINAL_APPS) or "terminal" in wl or "~" in window_name or window_name.endswith("$") or "@" in window_name
+
+
+def proof_text(text):
+    """Basic proofing: capitalize 'i' pronoun and fix capitalization after sentence punctuation."""
+    # Capitalize standalone "i" and its contractions (i'm, i'll, i'd, i've, i's)
+    text = re.sub(r"\bi('m|'ll|'d|'ve|'s)?\b", lambda m: "I" + (m.group(1) or ""), text)
+    # Capitalize first letter after sentence-ending punctuation (. ! ?)
+    text = re.sub(r'([.!?])\s+([a-z])', lambda m: m.group(1) + " " + m.group(2).upper(), text)
+    return text
 
 
 class DictationApp(Gtk.Application):
@@ -508,10 +518,12 @@ class DictationApp(Gtk.Application):
         self._start_dot_animation("Proofing")
 
     def paste_text(self, text):
-        """Copy to Wayland clipboard and paste instantly via Ctrl+V"""
+        """Proof text and type it into the target window via ydotool."""
         need_alt_tab = not self.hotkey_triggered
         self.hotkey_triggered = False
-        print(f"paste_text: {len(text)} chars (need_alt_tab={need_alt_tab})", flush=True)
+        proofed = proof_text(text)
+        print(f"paste_text: {len(proofed)} chars (need_alt_tab={need_alt_tab})", flush=True)
+        print(f"Proofed: '{proofed[:200]}'", flush=True)
 
         def do_paste():
             try:
@@ -525,12 +537,12 @@ class DictationApp(Gtk.Application):
                 else:
                     time.sleep(0.3)
 
-                # Type text with zero delays — fast burst
+                # Type text with minimal delays — fast burst
                 subprocess.run(
-                    ["ydotool", "type", "--key-delay", "2", "--key-hold", "0", "--", text],
+                    ["ydotool", "type", "--key-delay", "2", "--key-hold", "0", "--", proofed],
                     env=env, check=False, timeout=120
                 )
-                print(f"Typed {len(text)} chars", flush=True)
+                print(f"Typed {len(proofed)} chars", flush=True)
             except Exception as e:
                 print(f"Paste error: {e}", flush=True)
 
