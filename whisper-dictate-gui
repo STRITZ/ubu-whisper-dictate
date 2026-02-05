@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Simple dictation GUI using whisper.cpp"""
+"""Simple dictation GUI using whisper.cpp with hotkey support"""
+
+import os
+import sys
+
+# Force X11 backend so we can use wmctrl to set always-on-top.
+# wl-copy and ydotool still work since they're independent Wayland clients.
+os.environ.setdefault('GDK_BACKEND', 'x11')
 
 import gi
 import subprocess
-import os
-import sys
 import time
+import socket
+import threading
 
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib, Gio
@@ -15,6 +22,7 @@ MODEL = f"{WHISPER_DIR}/models/ggml-tiny.en.bin"
 WHISPER_BIN = f"{WHISPER_DIR}/build/bin/whisper-cli"
 AUDIO_FILE = "/tmp/dictation_audio.wav"
 YDOTOOL_SOCKET = os.path.expanduser("~/.ydotool_socket")
+IPC_SOCKET = "/tmp/whisper-dictate.sock"
 
 # Common whisper hallucinations from silence/noise - filter these out
 HALLUCINATIONS = {
@@ -29,20 +37,30 @@ TERMINAL_APPS = {"gnome-terminal-server", "gnome-terminal", "konsole", "xterm",
     "terminator", "tilix", "alacritty", "kitty", "wezterm", "urxvt",
     "xfce4-terminal", "lxterminal", "mate-terminal", "terminology"}
 
+
+def send_toggle_command():
+    """Send toggle command to running instance."""
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(IPC_SOCKET)
+        sock.send(b"toggle")
+        sock.close()
+        return True
+    except (socket.error, FileNotFoundError):
+        return False
+
+
 def get_active_window_name():
     """Get active window name using wmctrl or fallback"""
     try:
-        # Try using qdbus to get active window from KWin/GNOME
         result = subprocess.run(
             ["bash", "-c", """
-            # Get list of windows and find the active one
             for wid in $(xdotool search --onlyvisible --name ""); do
                 if xprop -id $wid 2>/dev/null | grep -q "_NET_WM_STATE_FOCUSED"; then
                     xdotool getwindowname $wid 2>/dev/null
                     exit 0
                 fi
             done
-            # Fallback: check /proc for foreground process
             cat /proc/$(xdotool getactivewindow getwindowpid 2>/dev/null)/comm 2>/dev/null || echo "unknown"
             """],
             capture_output=True, text=True, timeout=2
@@ -51,28 +69,48 @@ def get_active_window_name():
     except:
         return "unknown"
 
+
 def is_terminal(window_name):
     """Check if window name suggests a terminal"""
     if not window_name:
         return False
     wl = window_name.lower()
-    # Check for common terminal indicators
     return any(t in wl for t in TERMINAL_APPS) or "terminal" in wl or "~" in window_name or window_name.endswith("$") or "@" in window_name
+
 
 class DictationApp(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="com.local.whisper-dictate")
+        super().__init__(application_id="com.local.whisper-dictate",
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.recording = False
         self.record_process = None
         self.window = None
         self.button = None
         self.status_label = None
         self.target_is_terminal = False
+        self.ipc_server = None
+
+    def do_command_line(self, command_line):
+        args = command_line.get_arguments()
+
+        if "--toggle" in args:
+            # Send toggle to running instance
+            if send_toggle_command():
+                print("Toggle sent to running instance")
+                return 0
+            else:
+                print("No running instance found, starting new one...")
+
+        self.activate()
+        return 0
 
     def do_activate(self):
         if self.window:
             self.window.present()
             return
+
+        # Start IPC server
+        self.start_ipc_server()
 
         self.window = Gtk.ApplicationWindow(application=self)
         self.window.set_title("")
@@ -128,6 +166,62 @@ class DictationApp(Gtk.Application):
 
         self.set_ready_state()
         self.window.present()
+
+        # Set always-on-top after window is fully mapped
+        GLib.timeout_add(200, self._set_always_on_top)
+
+    def _set_always_on_top(self):
+        """Set window as always-on-top using xdotool + wmctrl."""
+        try:
+            result = subprocess.run(
+                ["xdotool", "search", "--pid", str(os.getpid())],
+                capture_output=True, text=True, timeout=2
+            )
+            for wid in result.stdout.strip().split('\n'):
+                if wid:
+                    subprocess.run(
+                        ["wmctrl", "-i", "-r", wid, "-b", "add,above"],
+                        check=False, capture_output=True, timeout=2
+                    )
+        except FileNotFoundError as e:
+            print(f"Missing tool for always-on-top: {e}")
+        except Exception as e:
+            print(f"Could not set always-on-top: {e}")
+        return False
+
+    def start_ipc_server(self):
+        """Start Unix socket server for IPC."""
+        # Remove existing socket
+        try:
+            os.unlink(IPC_SOCKET)
+        except OSError:
+            pass
+
+        def server_thread():
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(IPC_SOCKET)
+            server.listen(1)
+            self.ipc_server = server
+
+            while True:
+                try:
+                    conn, _ = server.accept()
+                    data = conn.recv(1024).decode()
+                    conn.close()
+
+                    if data == "toggle":
+                        # Schedule toggle on main thread
+                        GLib.idle_add(self.toggle_recording)
+                except:
+                    break
+
+        thread = threading.Thread(target=server_thread, daemon=True)
+        thread.start()
+
+    def toggle_recording(self):
+        """Toggle recording state (called from IPC)."""
+        self.on_button_clicked(None)
+        return False
 
     def set_ready_state(self):
         self.button.remove_css_class("mic-recording")
@@ -209,13 +303,12 @@ class DictationApp(Gtk.Application):
         try:
             result = subprocess.run(
                 [WHISPER_BIN, "-m", MODEL, "-f", AUDIO_FILE,
-                 "--no-timestamps", "-nt", "-np"],  # -np suppresses debug output
+                 "--no-timestamps", "-nt", "-np"],
                 capture_output=True,
                 text=True
             )
             text = result.stdout.strip()
 
-            # Debug: print what we got
             print(f"Whisper output: '{text}'")
 
             # Filter out common hallucinations from silence
@@ -241,6 +334,12 @@ class DictationApp(Gtk.Application):
 
         return False
 
+
 if __name__ == "__main__":
+    # Check for --toggle with no running instance
+    if "--toggle" in sys.argv and not os.path.exists(IPC_SOCKET):
+        print("No running instance. Start the app first.")
+        sys.exit(1)
+
     app = DictationApp()
     app.run(sys.argv)

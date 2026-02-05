@@ -62,7 +62,8 @@ sudo apt install -y \
     cmake \
     build-essential \
     xdotool \
-    x11-utils
+    x11-utils \
+    wmctrl
 
 print_success "System dependencies installed"
 
